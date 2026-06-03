@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from io import BytesIO
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import pandas as pd
 import streamlit as st
@@ -221,6 +221,7 @@ def build_payroll(daily: pd.DataFrame, master: pd.DataFrame, settings: PayrollSe
     payroll = daily.groupby("employee_id", as_index=False).agg(
         present_days=("payable_days", "sum"),
         calendar_days=("date", "nunique"),
+        absent_days=("attendance_status", lambda values: int((values == "Absent").sum())),
         total_hours=("work_hours", "sum"),
         overtime_hours=("overtime_hours", "sum"),
         late_instances=("late_minutes", lambda values: int((values > 0).sum())),
@@ -249,6 +250,7 @@ def build_payroll(daily: pd.DataFrame, master: pd.DataFrame, settings: PayrollSe
             "employee_name",
             "calendar_days",
             "present_days",
+            "absent_days",
             "total_hours",
             "overtime_hours",
             "late_instances",
@@ -260,6 +262,59 @@ def build_payroll(daily: pd.DataFrame, master: pd.DataFrame, settings: PayrollSe
             "gross_pay",
         ]
     ].sort_values("employee_id")
+
+
+def normalize_period(period_value: date | Sequence[date], fallback_start: date, fallback_end: date) -> tuple[date, date]:
+    if isinstance(period_value, tuple) and len(period_value) == 2:
+        start_date, end_date = period_value
+    elif isinstance(period_value, list) and len(period_value) == 2:
+        start_date, end_date = period_value
+    elif isinstance(period_value, date):
+        start_date = end_date = period_value
+    else:
+        start_date, end_date = fallback_start, fallback_end
+
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    return start_date, end_date
+
+
+def filter_raw_attendance(attendance: pd.DataFrame, start_date: date, end_date: date) -> pd.DataFrame:
+    mask = attendance["punch_date"].between(start_date, end_date)
+    return attendance.loc[mask].copy()
+
+
+def build_period_attendance(
+    daily: pd.DataFrame, master: pd.DataFrame, start_date: date, end_date: date
+) -> pd.DataFrame:
+    if not master.empty:
+        employees = master[["employee_id"]].drop_duplicates().copy()
+    else:
+        employees = daily[["employee_id"]].drop_duplicates().copy()
+
+    selected_dates = pd.date_range(start_date, end_date, freq="D").date
+    calendar = pd.DataFrame({"date": [str(day) for day in selected_dates]})
+    employees["join_key"] = 1
+    calendar["join_key"] = 1
+    period_grid = employees.merge(calendar, on="join_key").drop(columns="join_key")
+
+    period_daily = period_grid.merge(daily, on=["employee_id", "date"], how="left")
+    period_daily["first_in"] = period_daily["first_in"].fillna("-")
+    period_daily["last_out"] = period_daily["last_out"].fillna("-")
+    period_daily["attendance_status"] = period_daily["attendance_status"].fillna("Absent")
+    numeric_columns = ["punch_count", "work_hours", "late_minutes", "overtime_hours", "payable_days"]
+    period_daily[numeric_columns] = period_daily[numeric_columns].fillna(0)
+    period_daily["punch_count"] = period_daily["punch_count"].astype(int)
+
+    if not master.empty:
+        period_daily = period_daily.merge(master[["employee_id", "employee_name"]], on="employee_id", how="left")
+        period_daily["employee_name"] = period_daily["employee_name"].fillna(period_daily["employee_id"])
+        first_columns = ["employee_id", "employee_name", "date"]
+    else:
+        first_columns = ["employee_id", "date"]
+
+    remaining_columns = [column for column in period_daily.columns if column not in first_columns]
+    return period_daily[first_columns + remaining_columns].sort_values(["employee_id", "date"]).reset_index(drop=True)
 
 
 def to_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
@@ -307,29 +362,20 @@ def render_sidebar() -> tuple[PayrollSettings, BytesIO | None, BytesIO | None, b
 
 def render_empty_state() -> None:
     st.info("Upload an attendance file from the sidebar to generate payroll.")
-    st.markdown("""
-    **Expected attendance format** (like your screenshot):
-
-    | Employee ID | Punch Date | Punch Time |
-    | --- | --- | --- |
-    | SKVFT027 | 01-03-2026 | 07:07:47 |
-    | SKVFT048 | 01-03-2026 | 07:38:46 |
-
-    The app reads the first three non-empty columns, so files without headers are supported.
-    """)
+    st.caption("After upload, use the calendar filter to choose the payroll period and view present, absent, overtime, and salary details.")
 
 
 def render_metrics(daily: pd.DataFrame, payroll: pd.DataFrame) -> None:
     total_employees = payroll["employee_id"].nunique()
     total_present_days = payroll["present_days"].sum()
+    total_absent_days = payroll["absent_days"].sum() if "absent_days" in payroll else 0
     total_gross_pay = payroll["gross_pay"].sum()
-    total_overtime = payroll["overtime_hours"].sum()
     cols = st.columns(4)
     metrics: Iterable[tuple[str, str]] = [
         ("Employees", f"{total_employees:,}"),
         ("Payable Days", f"{total_present_days:,.1f}"),
+        ("Absent Days", f"{total_absent_days:,.0f}"),
         ("Gross Payroll", f"₹{total_gross_pay:,.2f}"),
-        ("Overtime Hours", f"{total_overtime:,.2f}"),
     ]
     for column, (label, value) in zip(cols, metrics):
         with column:
@@ -350,36 +396,56 @@ def main() -> None:
         attendance = load_attendance(attendance_file, has_header)
         master = load_employee_master(employee_file)
         daily = build_daily_attendance(attendance, settings)
-        payroll = build_payroll(daily, master, settings)
     except Exception as exc:  # Streamlit should show a friendly upload/configuration error.
         st.error(f"Unable to process the uploaded file: {exc}")
         return
 
-    render_metrics(daily, payroll)
+    available_start = attendance["punch_date"].min()
+    available_end = attendance["punch_date"].max()
+    st.subheader("📅 Attendance Period")
+    selected_period = st.date_input(
+        "Choose date range to view employee present/absent details",
+        value=(available_start, available_end),
+        min_value=available_start,
+        max_value=available_end,
+    )
+    start_date, end_date = normalize_period(selected_period, available_start, available_end)
+    period_daily_source = daily[pd.to_datetime(daily["date"]).dt.date.between(start_date, end_date)].copy()
+    period_daily = build_period_attendance(period_daily_source, master, start_date, end_date)
+    payroll = build_payroll(period_daily, master, settings)
+    period_attendance = filter_raw_attendance(attendance, start_date, end_date)
 
-    tabs = st.tabs(["Payroll Summary", "Daily Attendance", "Raw Punches", "Export"])
+    st.caption(f"Showing employee details from {start_date.strftime('%d-%m-%Y')} to {end_date.strftime('%d-%m-%Y')}.")
+    render_metrics(period_daily, payroll)
+
+    tabs = st.tabs(["Payroll Summary", "Employee Details", "Daily Attendance", "Raw Punches", "Export"])
     with tabs[0]:
         st.subheader("Payroll Summary")
         st.dataframe(payroll, use_container_width=True, hide_index=True)
     with tabs[1]:
-        st.subheader("Daily Attendance Register")
+        st.subheader("Employee Present / Absent Details")
         status_filter = st.multiselect(
             "Filter by status",
-            options=sorted(daily["attendance_status"].unique()),
-            default=sorted(daily["attendance_status"].unique()),
+            options=sorted(period_daily["attendance_status"].unique()),
+            default=sorted(period_daily["attendance_status"].unique()),
         )
-        filtered_daily = daily[daily["attendance_status"].isin(status_filter)] if status_filter else daily
-        st.dataframe(filtered_daily, use_container_width=True, hide_index=True)
+        filtered_details = (
+            period_daily[period_daily["attendance_status"].isin(status_filter)] if status_filter else period_daily
+        )
+        st.dataframe(filtered_details, use_container_width=True, hide_index=True)
     with tabs[2]:
+        st.subheader("Daily Attendance Register")
+        st.dataframe(period_daily_source, use_container_width=True, hide_index=True)
+    with tabs[3]:
         st.subheader("Imported Biometric Punches")
         st.dataframe(
-            attendance.assign(punch_datetime=attendance["punch_datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")),
+            period_attendance.assign(punch_datetime=period_attendance["punch_datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")),
             use_container_width=True,
             hide_index=True,
         )
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("Download Reports")
-        report = to_excel({"Payroll Summary": payroll, "Daily Attendance": daily, "Raw Punches": attendance})
+        report = to_excel({"Payroll Summary": payroll, "Employee Details": period_daily, "Raw Punches": period_attendance})
         st.download_button(
             "⬇️ Download payroll workbook",
             data=report,
